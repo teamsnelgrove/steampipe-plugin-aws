@@ -20,6 +20,16 @@ type awsConfig struct {
 	IgnoreErrorCodes      []string `hcl:"ignore_error_codes,optional"`
 	EndpointUrl           *string  `hcl:"endpoint_url"`
 	S3ForcePathStyle      *bool    `hcl:"s3_force_path_style"`
+
+	// Inline IAM AssumeRole. Upstream the plugin can only assume a role via a
+	// named `profile` resolved from ~/.aws/config; this fork lets the role be
+	// passed in the connection config so the source process needs no shared
+	// config file (see service.go getBaseClientForAccountUncached). The base
+	// credentials that perform the assume come from whatever else resolves into
+	// the config (IMDS, env, or a `profile`).
+	RoleArn         *string `hcl:"role_arn"`
+	ExternalId      *string `hcl:"external_id"`
+	RoleSessionName *string `hcl:"role_session_name"`
 }
 
 func ConfigInstance() interface{} {

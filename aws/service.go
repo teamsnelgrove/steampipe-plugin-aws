@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/accessanalyzer"
 	"github.com/aws/aws-sdk-go-v2/service/account"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
@@ -2324,6 +2325,26 @@ func getBaseClientForAccountUncached(ctx context.Context, d *plugin.QueryData, h
 	if err != nil {
 		plugin.Logger(ctx).Error("getBaseClientForAccountUncached", "connection_name", d.Connection.Name, "load_default_config_error", err)
 		return nil, err
+	}
+
+	// Fork addition: inline IAM AssumeRole. When role_arn is set in the
+	// connection config, wrap the resolved credentials (IMDS / env / profile)
+	// as the source for an STS AssumeRole provider, mirroring what a
+	// role_arn/source_profile pair in ~/.aws/config would do, but without a
+	// shared config file. NewCredentialsCache lets the SDK re-assume on expiry.
+	// See connection_config.go awsConfig.RoleArn.
+	if awsSpcConfig.RoleArn != nil {
+		stsClient := sts.NewFromConfig(cfg)
+		provider := stscreds.NewAssumeRoleProvider(stsClient, aws.ToString(awsSpcConfig.RoleArn),
+			func(o *stscreds.AssumeRoleOptions) {
+				if awsSpcConfig.ExternalId != nil {
+					o.ExternalID = awsSpcConfig.ExternalId
+				}
+				if awsSpcConfig.RoleSessionName != nil {
+					o.RoleSessionName = aws.ToString(awsSpcConfig.RoleSessionName)
+				}
+			})
+		cfg.Credentials = aws.NewCredentialsCache(provider)
 	}
 
 	// Even though we create a client per region and set the region during that
