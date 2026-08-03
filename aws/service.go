@@ -2043,33 +2043,12 @@ func getClientWithMaxRetries(ctx context.Context, d *plugin.QueryData, region st
 	// Plugin level config
 	awsSpcConfig := GetConfig(d.Connection)
 
-	// If there is a custom endpoint, use it
-	var awsEndpointUrl string
-	awsEndpointUrl = os.Getenv("AWS_ENDPOINT_URL")
-	if awsSpcConfig.EndpointUrl != nil {
-		awsEndpointUrl = *awsSpcConfig.EndpointUrl
-
-		// The aws.EndpointResolverWithOptionsFunc() is deprecated in AWS SDK v2 (version >= v1.27.0).
-		// However, we are intentionally keeping it for now to maintain backward compatibility, and plan to remove it in the future.
-		// Since its usage currently causes a lint failure, we have added a nolint directive here to suppress the warning temporarily.
-		//nolint:staticcheck // using custom endpoint resolver intentionally for legacy compatibility
-		if awsEndpointUrl != "" {
-			customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-				return aws.Endpoint{
-					PartitionID:   "aws",
-					URL:           awsEndpointUrl,
-					SigningRegion: region,
-				}, nil
-			})
-			newCfg, err := config.LoadDefaultConfig(ctx, config.WithEndpointResolverWithOptions(customResolver))
-			if err != nil {
-				plugin.Logger(ctx).Error("service.getClientWithMaxRetries", "connection_error", err)
-				return nil, err
-			}
-			newCfg.Retryer = cfg.Retryer
-			newCfg.Region = cfg.Region
-			cfg = newCfg
-		}
+	// If there is a custom endpoint, use it. Mutate the copied config's
+	// BaseEndpoint rather than rebuilding it with LoadDefaultConfig: a rebuild
+	// resolves credentials from the ambient default chain, silently discarding
+	// the connection's static-key or assume-role provider.
+	if awsSpcConfig.EndpointUrl != nil && *awsSpcConfig.EndpointUrl != "" {
+		cfg.BaseEndpoint = aws.String(*awsSpcConfig.EndpointUrl)
 	}
 
 	plugin.Logger(ctx).Debug("getClientWithMaxRetries", "connection_name", d.Connection.Name, "region", region, "status", "done")
@@ -2327,26 +2306,6 @@ func getBaseClientForAccountUncached(ctx context.Context, d *plugin.QueryData, h
 		return nil, err
 	}
 
-	// Fork addition: inline IAM AssumeRole. When role_arn is set in the
-	// connection config, wrap the resolved credentials (IMDS / env / profile)
-	// as the source for an STS AssumeRole provider, mirroring what a
-	// role_arn/source_profile pair in ~/.aws/config would do, but without a
-	// shared config file. NewCredentialsCache lets the SDK re-assume on expiry.
-	// See connection_config.go awsConfig.RoleArn.
-	if awsSpcConfig.RoleArn != nil {
-		stsClient := sts.NewFromConfig(cfg)
-		provider := stscreds.NewAssumeRoleProvider(stsClient, aws.ToString(awsSpcConfig.RoleArn),
-			func(o *stscreds.AssumeRoleOptions) {
-				if awsSpcConfig.ExternalId != nil {
-					o.ExternalID = awsSpcConfig.ExternalId
-				}
-				if awsSpcConfig.RoleSessionName != nil {
-					o.RoleSessionName = aws.ToString(awsSpcConfig.RoleSessionName)
-				}
-			})
-		cfg.Credentials = aws.NewCredentialsCache(provider)
-	}
-
 	// Even though we create a client per region and set the region during that
 	// step, we need to pass a region in the config options if the AWS SDK could
 	// not resolve a region from environment variables or the AWS config.
@@ -2354,6 +2313,10 @@ func getBaseClientForAccountUncached(ctx context.Context, d *plugin.QueryData, h
 	// API calls for IAM role authentication; if it's not set here, a signing
 	// error is thrown for API calls with this client, e.g.,
 	// Error: operation error CloudFront: ListDistributions, failed to sign request: failed to retrieve credentials: failed to refresh cached credentials, operation error STS: AssumeRole, failed to resolve service endpoint, an AWS region is required, but was not found
+	//
+	// This reload must happen BEFORE any credential wrapping below: it rebuilds
+	// cfg from configOptions, so anything assigned onto cfg after LoadDefaultConfig
+	// (like the AssumeRole provider) would be silently discarded.
 	if cfg.Region == "" {
 		defaultRegion, err := getDefaultRegionFromConfig(ctx, d, nil)
 		if err != nil {
@@ -2368,6 +2331,27 @@ func getBaseClientForAccountUncached(ctx context.Context, d *plugin.QueryData, h
 			plugin.Logger(ctx).Error("getBaseClientForAccountUncached", "connection_name", d.Connection.Name, "load_default_config_error", err)
 			return nil, err
 		}
+	}
+
+	// Fork addition: inline IAM AssumeRole. When role_arn is set in the
+	// connection config, wrap the resolved credentials (IMDS / env / profile)
+	// as the source for an STS AssumeRole provider, mirroring what a
+	// role_arn/source_profile pair in ~/.aws/config would do, but without a
+	// shared config file. NewCredentialsCache lets the SDK re-assume on expiry.
+	// See connection_config.go awsConfig.RoleArn.
+	// Must stay last: any LoadDefaultConfig after this line drops the wrap.
+	if awsSpcConfig.RoleArn != nil {
+		stsClient := sts.NewFromConfig(cfg)
+		provider := stscreds.NewAssumeRoleProvider(stsClient, aws.ToString(awsSpcConfig.RoleArn),
+			func(o *stscreds.AssumeRoleOptions) {
+				if awsSpcConfig.ExternalId != nil {
+					o.ExternalID = awsSpcConfig.ExternalId
+				}
+				if awsSpcConfig.RoleSessionName != nil {
+					o.RoleSessionName = aws.ToString(awsSpcConfig.RoleSessionName)
+				}
+			})
+		cfg.Credentials = aws.NewCredentialsCache(provider)
 	}
 
 	plugin.Logger(ctx).Debug("getBaseClientForAccountUncached", "connection_name", d.Connection.Name, "status", "done")
